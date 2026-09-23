@@ -2,11 +2,15 @@
 Glovely — Modal inference server
 Stable Diffusion 1.5 img2img + glove LoRA, accelerated with LCM-LoRA (4-step).
 
-Deploy:   modal deploy modal_inference.py
-Dev:      modal serve modal_inference.py
+First-time setup:
+  modal run modal_inference.py::upload_weights   # upload glove LoRA
+  modal run modal_inference.py::download_models  # cache SD1.5 + LCM-LoRA to volume
 
-Upload weights first:
-  modal run modal_inference.py::upload_weights
+Deploy:
+  modal deploy modal_inference.py
+
+Dev:
+  modal serve modal_inference.py
 """
 
 import io
@@ -14,7 +18,7 @@ import base64
 import modal
 
 # ---------------------------------------------------------------------------
-# Image — CUDA + diffusers (no StreamDiffusion; uses LCM-LoRA for speed)
+# Image — lean: just packages, no model downloads at build time
 # ---------------------------------------------------------------------------
 
 image = (
@@ -23,56 +27,45 @@ image = (
         add_python="3.11",
     )
     .pip_install(
-        "torch==2.1.2",
-        "torchvision==0.16.2",
-        "xformers==0.0.23.post1",
+        "torch==2.4.1",
+        "torchvision==0.19.1",
         index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
-        "diffusers==0.27.2",
-        "transformers==4.38.2",
-        "accelerate==0.27.2",
+        "diffusers>=0.31.0",
+        "transformers>=4.40.0",
+        "accelerate>=0.30.0",
         "safetensors",
         "Pillow",
         "fastapi[standard]",
         "websockets",
     )
-    # Bake model weights into the image so cold starts don't re-download ~4GB.
-    # Image build is slow once; container startup becomes ~30s instead of 5min.
-    .run_commands(
-        "python -c \""
-        "from diffusers import StableDiffusionImg2ImgPipeline; "
-        "StableDiffusionImg2ImgPipeline.from_pretrained("
-        "'runwayml/stable-diffusion-v1-5', cache_dir='/model-cache'"
-        ")\"",
-        "python -c \""
-        "from huggingface_hub import snapshot_download; "
-        "snapshot_download('latent-consistency/lcm-lora-sdv1-5', cache_dir='/model-cache')"
-        "\"",
-    )
 )
 
 app = modal.App("glovely", image=image)
 
-# Volume stores LoRA weights — persists across container restarts.
+# ---------------------------------------------------------------------------
+# Volume — stores both LoRA weights and cached base models
+# ---------------------------------------------------------------------------
+
 volume = modal.Volume.from_name("glovely-weights", create_if_missing=True)
 VOLUME_PATH = "/weights"
 LORA_FILENAME = "pytorch_lora_weights.safetensors"
+MODEL_CACHE = f"{VOLUME_PATH}/model-cache"
 
 BASE_MODEL = "runwayml/stable-diffusion-v1-5"
 LCM_LORA_ID = "latent-consistency/lcm-lora-sdv1-5"
-MODEL_CACHE = "/model-cache"
 
 
 # ---------------------------------------------------------------------------
-# Pipeline class — kept warm between requests
+# Pipeline class
 # ---------------------------------------------------------------------------
 
 @app.cls(
     gpu="T4",
     volumes={VOLUME_PATH: volume},
-    min_containers=1,      # one container stays alive to avoid cold starts
-    scaledown_window=300,  # scale to zero after 5min idle
+    min_containers=1,
+    scaledown_window=300,
 )
 class GlovePipeline:
 
@@ -83,7 +76,7 @@ class GlovePipeline:
 
         lora_path = f"{VOLUME_PATH}/{LORA_FILENAME}"
 
-        print(f"Loading {BASE_MODEL} from cache...")
+        print(f"Loading {BASE_MODEL} from volume cache...")
         self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
             BASE_MODEL,
             cache_dir=MODEL_CACHE,
@@ -91,26 +84,27 @@ class GlovePipeline:
             safety_checker=None,
         ).to("cuda")
 
-        # LCM-LoRA: swap scheduler + load LoRA for 4-step inference
-        print("Loading LCM-LoRA from cache...")
+        print("Swapping in LCM scheduler...")
         self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
-        self.pipe.load_lora_weights(LCM_LORA_ID, cache_dir=MODEL_CACHE, adapter_name="lcm")
 
-        # Glove LoRA on top of LCM
+        print("Loading LCM-LoRA from volume cache...")
+        self.pipe.load_lora_weights(
+            LCM_LORA_ID,
+            cache_dir=MODEL_CACHE,
+            adapter_name="lcm",
+        )
+
         print(f"Loading glove LoRA from {lora_path}...")
         self.pipe.load_lora_weights(lora_path, adapter_name="glove")
 
-        # Combine both LoRAs: LCM drives speed, glove drives style
         self.pipe.set_adapters(["lcm", "glove"], adapter_weights=[1.0, 0.8])
-
-        self.pipe.enable_xformers_memory_efficient_attention()
+        self.pipe.enable_attention_slicing()
 
         # Warmup
-        from PIL import Image
-        dummy = Image.new("RGB", (512, 512))
+        from PIL import Image as PILImage
         self.pipe(
             prompt="ohwx glove",
-            image=dummy,
+            image=PILImage.new("RGB", (512, 512)),
             num_inference_steps=4,
             guidance_scale=1.0,
             strength=0.6,
@@ -119,30 +113,26 @@ class GlovePipeline:
 
     @modal.method()
     def generate(self, image_b64: str, prompt: str = "ohwx glove") -> str:
-        """
-        Takes a base64-encoded JPEG (cropped hand frame, 512×512).
-        Returns a base64-encoded JPEG (generated glove frame).
-        """
         import torch
-        from PIL import Image
+        from PIL import Image as PILImage
 
         image_bytes = base64.b64decode(image_b64)
-        input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((512, 512))
+        input_image = (
+            PILImage.open(io.BytesIO(image_bytes)).convert("RGB").resize((512, 512))
+        )
 
         with torch.inference_mode():
             result = self.pipe(
                 prompt=prompt,
                 negative_prompt="blurry, deformed, low quality, extra fingers",
                 image=input_image,
-                num_inference_steps=4,   # LCM: 4 steps is enough
-                guidance_scale=1.0,      # LCM works best at guidance_scale=1
-                strength=0.6,            # how much to deviate from input pose
+                num_inference_steps=4,
+                guidance_scale=1.0,
+                strength=0.6,
             )
 
-        output_image = result.images[0]
-
         buf = io.BytesIO()
-        output_image.save(buf, format="JPEG", quality=85)
+        result.images[0].save(buf, format="JPEG", quality=85)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -153,10 +143,7 @@ class GlovePipeline:
 @app.function()
 @modal.fastapi_endpoint(method="POST")
 def infer(body: dict) -> dict:
-    """
-    POST { "image": "<base64>", "prompt": "ohwx glove" }
-    →    { "image": "<base64>" }
-    """
+    """POST { "image": "<base64>", "prompt": "ohwx glove" } → { "image": "<base64>" }"""
     result = GlovePipeline().generate.remote(
         image_b64=body["image"],
         prompt=body.get("prompt", "ohwx glove"),
@@ -165,7 +152,7 @@ def infer(body: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket endpoint (alternative to HTTP for lower round-trip latency)
+# WebSocket endpoint
 # ---------------------------------------------------------------------------
 
 @app.function()
@@ -180,11 +167,9 @@ def ws_app():
     @fastapi_app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
-        print("WebSocket client connected")
         try:
             while True:
-                data = await websocket.receive_text()
-                msg = json.loads(data)
+                msg = json.loads(await websocket.receive_text())
                 result_b64 = await pipeline.generate.remote.aio(
                     image_b64=msg["image"],
                     prompt=msg.get("prompt", "ohwx glove"),
@@ -197,14 +182,45 @@ def ws_app():
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint — upload LoRA weights to the Modal volume
+# One-time setup: download base models to the volume
+# Run once after first deploy: modal run modal_inference.py::download_models
+# ---------------------------------------------------------------------------
+
+@app.function(volumes={VOLUME_PATH: volume}, timeout=1800)
+def _download_models():
+    from diffusers import StableDiffusionImg2ImgPipeline
+    from huggingface_hub import snapshot_download
+    import os
+
+    os.makedirs(MODEL_CACHE, exist_ok=True)
+
+    print(f"Downloading {BASE_MODEL}...")
+    StableDiffusionImg2ImgPipeline.from_pretrained(
+        BASE_MODEL, cache_dir=MODEL_CACHE
+    )
+
+    print(f"Downloading {LCM_LORA_ID}...")
+    snapshot_download(LCM_LORA_ID, cache_dir=MODEL_CACHE)
+
+    volume.commit()
+    print("Models cached to volume.")
+
+
+@app.local_entrypoint()
+def download_models():
+    """modal run modal_inference.py::download_models"""
+    print("Downloading base models to Modal volume (runs once)...")
+    _download_models.remote()
+    print("Done.")
+
+
+# ---------------------------------------------------------------------------
+# Upload glove LoRA weights to the volume
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
 def upload_weights():
-    """
-    modal run modal_inference.py::upload_weights
-    """
+    """modal run modal_inference.py::upload_weights"""
     import os
 
     local_path = "./glove-lora/pytorch_lora_weights.safetensors"
@@ -213,9 +229,7 @@ def upload_weights():
 
     print(f"Uploading {local_path} → {VOLUME_PATH}/{LORA_FILENAME}")
     with open(local_path, "rb") as f:
-        data = f.read()
-
-    _upload_file.remote(data, LORA_FILENAME)
+        _upload_file.remote(f.read(), LORA_FILENAME)
     print("Done.")
 
 
