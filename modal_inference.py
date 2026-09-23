@@ -1,6 +1,6 @@
 """
 Glovely — Modal inference server
-StreamDiffusion img2img pipeline with glove LoRA.
+Stable Diffusion 1.5 img2img + glove LoRA, accelerated with LCM-LoRA (4-step).
 
 Deploy:   modal deploy modal_inference.py
 Dev:      modal serve modal_inference.py
@@ -14,15 +14,14 @@ import base64
 import modal
 
 # ---------------------------------------------------------------------------
-# Image — CUDA + StreamDiffusion + dependencies
+# Image — CUDA + diffusers (no StreamDiffusion; uses LCM-LoRA for speed)
 # ---------------------------------------------------------------------------
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04",
+        "nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04",
         add_python="3.11",
     )
-    .apt_install("git", "libglib2.0-0", "libsm6", "libxext6", "libxrender-dev")
     .pip_install(
         "torch==2.1.2",
         "torchvision==0.16.2",
@@ -30,30 +29,26 @@ image = (
         index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
-        "diffusers>=0.28.0",
-        "transformers>=4.36.0",
-        "accelerate>=0.26.0",
+        "diffusers==0.27.2",
+        "transformers==4.38.2",
+        "accelerate==0.27.2",
         "safetensors",
         "Pillow",
         "fastapi[standard]",
-        "python-multipart",
         "websockets",
-    )
-    .run_commands(
-        # StreamDiffusion with TensorRT support
-        "pip install git+https://github.com/cumulo-autumn/StreamDiffusion.git@main#egg=streamdiffusion[tensorrt]",
-        "python -m streamdiffusion.tools.install-tensorrt",
     )
 )
 
 app = modal.App("glovely", image=image)
 
-# Volume stores LoRA weights so they persist across container restarts
-# and don't need re-downloading on every cold start.
+# Volume stores LoRA weights — persists across container restarts.
 volume = modal.Volume.from_name("glovely-weights", create_if_missing=True)
 VOLUME_PATH = "/weights"
 LORA_FILENAME = "pytorch_lora_weights.safetensors"
-BASE_MODEL = "KiwiXR/stable-diffusion-v1-5"  # community mirror; same weights
+
+BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+# LCM-LoRA enables 4-step inference (~0.5s on A10G vs ~3s at 20 steps)
+LCM_LORA_ID = "latent-consistency/lcm-lora-sdv1-5"
 
 
 # ---------------------------------------------------------------------------
@@ -61,96 +56,92 @@ BASE_MODEL = "KiwiXR/stable-diffusion-v1-5"  # community mirror; same weights
 # ---------------------------------------------------------------------------
 
 @app.cls(
-    gpu="A10G",
+    gpu="T4",
     volumes={VOLUME_PATH: volume},
-    keep_warm=1,           # keeps one container alive to avoid cold starts
-    container_idle_timeout=300,  # scale to zero after 5min of no requests
+    min_containers=1,      # one container stays alive to avoid cold starts
+    scaledown_window=300,  # scale to zero after 5min idle
 )
 class GlovePipeline:
 
     @modal.enter()
     def load(self):
         import torch
-        from streamdiffusion import StreamDiffusion
-        from streamdiffusion.image_utils import postprocess_image
-        from diffusers import AutoPipelineForImage2Image
+        from diffusers import StableDiffusionImg2ImgPipeline, LCMScheduler
 
         lora_path = f"{VOLUME_PATH}/{LORA_FILENAME}"
 
-        print(f"Loading pipeline from {BASE_MODEL}...")
-        pipe = AutoPipelineForImage2Image.from_pretrained(
+        print(f"Loading {BASE_MODEL}...")
+        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
             BASE_MODEL,
             torch_dtype=torch.float16,
-            variant="fp16",
-        )
+            safety_checker=None,
+        ).to("cuda")
 
-        print(f"Loading LoRA weights from {lora_path}...")
-        pipe.load_lora_weights(lora_path)
-        pipe.fuse_lora(lora_scale=1.0)
+        # LCM-LoRA: swap scheduler + load LoRA for 4-step inference
+        print("Loading LCM-LoRA...")
+        self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+        self.pipe.load_lora_weights(LCM_LORA_ID, adapter_name="lcm")
 
-        print("Wrapping in StreamDiffusion...")
-        self.stream = StreamDiffusion(
-            pipe,
-            t_index_list=[32, 45],   # denoising timestep indices — controls strength
-            torch_dtype=torch.float16,
-            cfg_type="none",          # faster, no classifier-free guidance overhead
-        )
-        self.stream.load_lcm_lora()   # LCM LoRA for fast few-step inference
-        self.stream.fuse_lora()
-        self.stream.enable_similar_image_filter(
-            similar_image_strength=0.98,
-            similar_distance=10,
-        )
-        self.stream = self.stream.to(device="cuda", dtype=torch.float16)
+        # Glove LoRA on top of LCM
+        print(f"Loading glove LoRA from {lora_path}...")
+        self.pipe.load_lora_weights(lora_path, adapter_name="glove")
 
-        # Warmup — first few calls are slow due to CUDA compilation
+        # Combine both LoRAs: LCM drives speed, glove drives style
+        self.pipe.set_adapters(["lcm", "glove"], adapter_weights=[1.0, 0.8])
+
+        self.pipe.enable_xformers_memory_efficient_attention()
+
+        # Warmup
         from PIL import Image
-        dummy = Image.new("RGB", (512, 512), color=(128, 128, 128))
-        self.stream.prepare(
+        dummy = Image.new("RGB", (512, 512))
+        self.pipe(
             prompt="ohwx glove",
-            negative_prompt="blurry, deformed, low quality",
-            num_inference_steps=50,
+            image=dummy,
+            num_inference_steps=4,
             guidance_scale=1.0,
+            strength=0.6,
         )
-        for _ in range(3):
-            self.stream(dummy)
-
-        self.postprocess = postprocess_image
         print("Pipeline ready.")
 
     @modal.method()
     def generate(self, image_b64: str, prompt: str = "ohwx glove") -> str:
         """
-        Takes a base64-encoded JPEG/PNG (cropped hand frame),
-        returns a base64-encoded PNG (generated glove frame).
+        Takes a base64-encoded JPEG (cropped hand frame, 512×512).
+        Returns a base64-encoded JPEG (generated glove frame).
         """
         import torch
         from PIL import Image
 
-        # Decode input
         image_bytes = base64.b64decode(image_b64)
         input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((512, 512))
 
-        # Run StreamDiffusion
-        output = self.stream(input_image)
-        output_image = self.postprocess(output, output_type="pil")[0]
+        with torch.inference_mode():
+            result = self.pipe(
+                prompt=prompt,
+                negative_prompt="blurry, deformed, low quality, extra fingers",
+                image=input_image,
+                num_inference_steps=4,   # LCM: 4 steps is enough
+                guidance_scale=1.0,      # LCM works best at guidance_scale=1
+                strength=0.6,            # how much to deviate from input pose
+            )
 
-        # Encode output
+        output_image = result.images[0]
+
         buf = io.BytesIO()
         output_image.save(buf, format="JPEG", quality=85)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
-# HTTP endpoint — called from the Next.js backend
+# HTTP endpoint
 # ---------------------------------------------------------------------------
 
 @app.function()
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def infer(body: dict) -> dict:
     """
     POST { "image": "<base64>", "prompt": "ohwx glove" }
-    → { "image": "<base64>" }
+    →    { "image": "<base64>" }
     """
     result = GlovePipeline().generate.remote(
         image_b64=body["image"],
@@ -160,7 +151,7 @@ def infer(body: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket endpoint — for lower-latency streaming (optional, use instead of HTTP)
+# WebSocket endpoint (alternative to HTTP for lower round-trip latency)
 # ---------------------------------------------------------------------------
 
 @app.function()
@@ -198,8 +189,7 @@ def ws_app():
 @app.local_entrypoint()
 def upload_weights():
     """
-    Run locally to push your trained LoRA to the Modal volume:
-      modal run modal_inference.py::upload_weights
+    modal run modal_inference.py::upload_weights
     """
     import os
 
@@ -207,15 +197,12 @@ def upload_weights():
     if not os.path.exists(local_path):
         raise FileNotFoundError(f"Not found: {local_path}")
 
-    print(f"Uploading {local_path} → Modal volume:{VOLUME_PATH}/{LORA_FILENAME}")
+    print(f"Uploading {local_path} → {VOLUME_PATH}/{LORA_FILENAME}")
     with open(local_path, "rb") as f:
         data = f.read()
 
-    volume.commit()  # ensure volume exists
-
-    # Write via a remote function so Modal handles the volume mount
     _upload_file.remote(data, LORA_FILENAME)
-    print("Done. Weights are available in the Modal volume.")
+    print("Done.")
 
 
 @app.function(volumes={VOLUME_PATH: volume})
