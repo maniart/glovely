@@ -37,6 +37,19 @@ image = (
         "fastapi[standard]",
         "websockets",
     )
+    # Bake model weights into the image so cold starts don't re-download ~4GB.
+    # Image build is slow once; container startup becomes ~30s instead of 5min.
+    .run_commands(
+        "python -c \""
+        "from diffusers import StableDiffusionImg2ImgPipeline; "
+        "StableDiffusionImg2ImgPipeline.from_pretrained("
+        "'runwayml/stable-diffusion-v1-5', cache_dir='/model-cache'"
+        ")\"",
+        "python -c \""
+        "from huggingface_hub import snapshot_download; "
+        "snapshot_download('latent-consistency/lcm-lora-sdv1-5', cache_dir='/model-cache')"
+        "\"",
+    )
 )
 
 app = modal.App("glovely", image=image)
@@ -47,8 +60,8 @@ VOLUME_PATH = "/weights"
 LORA_FILENAME = "pytorch_lora_weights.safetensors"
 
 BASE_MODEL = "runwayml/stable-diffusion-v1-5"
-# LCM-LoRA enables 4-step inference (~0.5s on A10G vs ~3s at 20 steps)
 LCM_LORA_ID = "latent-consistency/lcm-lora-sdv1-5"
+MODEL_CACHE = "/model-cache"
 
 
 # ---------------------------------------------------------------------------
@@ -70,17 +83,18 @@ class GlovePipeline:
 
         lora_path = f"{VOLUME_PATH}/{LORA_FILENAME}"
 
-        print(f"Loading {BASE_MODEL}...")
+        print(f"Loading {BASE_MODEL} from cache...")
         self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
             BASE_MODEL,
+            cache_dir=MODEL_CACHE,
             torch_dtype=torch.float16,
             safety_checker=None,
         ).to("cuda")
 
         # LCM-LoRA: swap scheduler + load LoRA for 4-step inference
-        print("Loading LCM-LoRA...")
+        print("Loading LCM-LoRA from cache...")
         self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
-        self.pipe.load_lora_weights(LCM_LORA_ID, adapter_name="lcm")
+        self.pipe.load_lora_weights(LCM_LORA_ID, cache_dir=MODEL_CACHE, adapter_name="lcm")
 
         # Glove LoRA on top of LCM
         print(f"Loading glove LoRA from {lora_path}...")

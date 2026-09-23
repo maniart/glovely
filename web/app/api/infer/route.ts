@@ -1,5 +1,8 @@
 import { NextRequest } from "next/server";
 
+// Allow up to 5 minutes — Modal cold start can take ~60s on first boot.
+export const maxDuration = 300;
+
 // Proxies inference requests to the Modal backend.
 // Keeps MODAL_INFERENCE_URL server-side — never exposed to the browser.
 export async function POST(req: NextRequest) {
