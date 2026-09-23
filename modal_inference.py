@@ -27,8 +27,8 @@ image = (
         add_python="3.11",
     )
     .pip_install(
-        "torch==2.4.1",
-        "torchvision==0.19.1",
+        "torch==2.5.1",
+        "torchvision==0.20.1",
         index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
