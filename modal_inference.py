@@ -98,7 +98,7 @@ class GlovePipeline:
         print(f"Loading glove LoRA from {lora_path}...")
         self.pipe.load_lora_weights(lora_path, adapter_name="glove")
 
-        self.pipe.set_adapters(["lcm", "glove"], adapter_weights=[1.0, 0.8])
+        self.pipe.set_adapters(["lcm", "glove"], adapter_weights=[1.0, 1.0])
         self.pipe.enable_attention_slicing()
 
         # Warmup
@@ -108,7 +108,7 @@ class GlovePipeline:
             image=PILImage.new("RGB", (512, 512)),
             num_inference_steps=4,
             guidance_scale=1.0,
-            strength=0.6,
+            strength=0.75,
         )
         print("Pipeline ready.")
 
@@ -125,11 +125,11 @@ class GlovePipeline:
         with torch.inference_mode():
             result = self.pipe(
                 prompt=prompt,
-                negative_prompt="blurry, deformed, low quality, extra fingers",
+                negative_prompt="blurry, deformed, low quality, human hand, skin, flesh, fingers, face, person, background",
                 image=input_image,
                 num_inference_steps=4,
                 guidance_scale=1.0,
-                strength=0.6,
+                strength=0.75,
             )
 
         buf = io.BytesIO()

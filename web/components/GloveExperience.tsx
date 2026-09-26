@@ -13,7 +13,7 @@ const MODEL_PATH =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 const INFER_INTERVAL_MS = 3000;
-const PROMPT = "ohwx glove";
+const PROMPT = "ohwx glove, leather work glove, worn texture, found object, surreal";
 
 // ─── Crossfade display state ─────────────────────────────────────────────────
 // Two image slots (A/B) — we write to the inactive slot, then flip `active`.
@@ -24,9 +24,37 @@ type DisplayState = {
   active: "A" | "B";
 };
 
+// ─── Convex hull (Graham scan) ────────────────────────────────────────────────
+function convexHull(pts: [number, number][]): [number, number][] {
+  const n = pts.length;
+  if (n < 3) return pts;
+  const sorted = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (
+    o: [number, number],
+    a: [number, number],
+    b: [number, number]
+  ) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower: [number, number][] = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0)
+      lower.pop();
+    lower.push(p);
+  }
+  const upper: [number, number][] = [];
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const p = sorted[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0)
+      upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper];
+}
+
 // ─── Hand crop utility ────────────────────────────────────────────────────────
-// Extracts a square region around the detected hand landmarks,
-// draws it into a 512×512 canvas, and returns a base64 JPEG string.
+// Crops a square region around the detected hand, masks everything outside
+// the convex hull of landmarks with a neutral background, and returns base64 JPEG.
 function cropHand(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
@@ -34,6 +62,7 @@ function cropHand(
 ): string {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
+  const ctx = canvas.getContext("2d")!;
 
   const xs = landmarks.map((l) => l.x);
   const ys = landmarks.map((l) => l.y);
@@ -56,8 +85,37 @@ function cropHand(
   const sw = Math.min(size, vw - sx);
   const sh = Math.min(size, vh - sy);
 
-  const ctx = canvas.getContext("2d")!;
+  // Fill with neutral background
+  ctx.fillStyle = "#1a1a1a";
+  ctx.fillRect(0, 0, 512, 512);
+
+  // Map landmarks into 512×512 canvas space
+  const canvasPts: [number, number][] = landmarks.map((l) => [
+    ((l.x * vw - sx) / sw) * 512,
+    ((l.y * vh - sy) / sh) * 512,
+  ]);
+
+  // Expand hull outward by 20px so fingertips aren't clipped
+  const hull = convexHull(canvasPts);
+  const hcx = hull.reduce((s, p) => s + p[0], 0) / hull.length;
+  const hcy = hull.reduce((s, p) => s + p[1], 0) / hull.length;
+  const HULL_PAD = 20;
+  const expanded: [number, number][] = hull.map(([x, y]) => {
+    const dx = x - hcx;
+    const dy = y - hcy;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    return [x + (dx / len) * HULL_PAD, y + (dy / len) * HULL_PAD];
+  });
+
+  // Clip to hull and draw video into that region
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(expanded[0][0], expanded[0][1]);
+  for (let i = 1; i < expanded.length; i++) ctx.lineTo(expanded[i][0], expanded[i][1]);
+  ctx.closePath();
+  ctx.clip();
   ctx.drawImage(video, sx, sy, sw, sh, 0, 0, 512, 512);
+  ctx.restore();
 
   return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
 }
