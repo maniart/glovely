@@ -35,6 +35,7 @@ image = (
         "diffusers>=0.31.0",
         "transformers>=4.40.0",
         "accelerate>=0.30.0",
+        "peft",
         "safetensors",
         "Pillow",
         "fastapi[standard]",
