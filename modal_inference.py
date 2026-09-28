@@ -65,8 +65,7 @@ LCM_LORA_ID = "latent-consistency/lcm-lora-sdv1-5"
 @app.cls(
     gpu="T4",
     volumes={VOLUME_PATH: volume},
-    min_containers=1,
-    scaledown_window=300,
+    scaledown_window=60,
 )
 class GlovePipeline:
 
