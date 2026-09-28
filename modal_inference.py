@@ -107,7 +107,7 @@ class GlovePipeline:
             image=PILImage.new("RGB", (512, 512)),
             num_inference_steps=4,
             guidance_scale=1.0,
-            strength=0.75,
+            strength=0.6,
         )
         print("Pipeline ready.")
 
@@ -128,7 +128,7 @@ class GlovePipeline:
                 image=input_image,
                 num_inference_steps=4,
                 guidance_scale=1.0,
-                strength=0.75,
+                strength=0.6,
             )
 
         buf = io.BytesIO()
